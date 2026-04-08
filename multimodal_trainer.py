@@ -1,0 +1,643 @@
+import torch
+import torch.nn as nn
+
+from torchvision.models.segmentation import (
+    deeplabv3_resnet50, 
+    deeplabv3_mobilenet_v3_large
+)
+
+from models.deeplab import DeepLabWrapper
+from models.UNet import UNet
+from models.unet_three_plus import UNet3Plus
+from models.attn_ghostnet import Ghost_Unet
+from models.fast_scnn import FastSCNN
+
+from models.networks.E_Net import ENet
+
+from segmentation_models_pytorch.losses import FocalLoss, LovaszLoss 
+ 
+from utils.tversky import TverskyLoss
+from utils.customloss import DiceLoss, DiceLoss2 
+
+from models.networks.config import (
+    Config_Unet,  
+    Config_Unet3P
+)
+ 
+
+
+import os, multiprocessing
+from tqdm import tqdm
+from datetime import datetime
+from loguru import logger
+import random
+import numpy as np
+from enum import Enum
+import argparse
+import json
+from collections import defaultdict
+
+from torch.utils.tensorboard import SummaryWriter
+
+from utils.testing import (
+    computeIOU, 
+    computeAccuracy, 
+    computeMetrics
+)
+
+from data_loading.sen1_multimodal import get_loader_MM
+
+
+from torch.amp import autocast, GradScaler
+
+from optimizers.evolved_sign_momentum import Lion
+from optimizers.soap import SOAP
+ 
+
+class DatasetType(Enum):
+    TRAIN = 'train'
+    VALID = 'valid'
+    TEST = 'test'
+    BOLIVIA = 'bolivia'
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Train Multimodal')
+    parser.add_argument('--data_path', type=str, default='./datasets/sen1floods11_v1.1', help='Path to the data directory.')
+    parser.add_argument('--version', type=str, default='Multimodal', help='Experiment version')
+    parser.add_argument('--batch_size', type=int, default=6, help='Batch size for training.')
+    parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs.')
+    parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate for the optimizer.')
+    parser.add_argument('--test_interval', type=int, default=1, help='Test the model every n epochs')
+    parser.add_argument('--loss_func', type=str, default='tversky', help='Loss function to use: bce, dice, dice2, focal, lovasz, tversky')
+    parser.add_argument('--finetune_ratio', type=float, default=1, help='Fine-tune ratio for Prithvi models')
+    parser.add_argument('--run_baseline', action='store_true', default=False, help='Run baseline models')
+    parser.add_argument('--full_seed', action='store_true', default=False, help='5 seed experiment')
+    parser.add_argument('--mixed_precision', action='store_true', default=False, help='use bf16 instead of fp32')
+    parser.add_argument('--grad_accumulation', type=int, default=None, help='simulate batch size x g')
+
+    return parser.parse_args()
+
+def get_number_of_trainable_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def get_total_parameters(model):
+    return sum(p.numel() for p in model.parameters())
+
+
+def is_boundary_conv(name):
+    return any(k in name for k in ["inc.", "outc.", "out_conv.", "up_seq"])  # inc=input, outc/out_conv=output, ConvTranspose in up_seq
+
+
+def compute_gradnorm(model, running_grad_norm):
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** 0.5
+    running_grad_norm += total_norm
+
+    return total_norm
+
+def train_model(model, loader, optimizer, criterion, epoch, device, writer=None):
+    model.train()
+    running_samples = 0
+    running_grad_norm = 0.0
+    batch_losses = []
+    batch_accuracies = []
+    batch_ious = []
+    optimizer.zero_grad()
+ 
+    effective_accum = args.grad_accumulation if args.grad_accumulation is not None else 1
+    
+    for batch_idx, batch_data in enumerate(tqdm(loader, desc=f"Training Epoch {epoch+1}"), 0):
+        sar_imgs, optical_imgs, elevation_imgs, masks, water_occur = batch_data
+ 
+        sar_imgs = sar_imgs.to(device, non_blocking=True)
+        optical_imgs = optical_imgs.to(device, non_blocking=True)
+        elevation_imgs = elevation_imgs.to(device, non_blocking=True)
+        water_occur = water_occur.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+              
+        with autocast(device_type="cuda", dtype=torch.bfloat16 if args.mixed_precision else torch.float32):
+            outputs = model(sar_imgs, optical_imgs, elevation_imgs, water_occur)
+           
+            targets = masks.squeeze(1) if len(masks.shape) > 3 else masks
+            loss = criterion(outputs, targets.long()) / effective_accum
+            
+        loss.backward()
+         
+        iou = computeIOU(outputs.float(), targets, device)
+        accuracy = computeAccuracy(outputs.float(), targets, device)
+         
+        if (batch_idx + 1) % effective_accum == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+             
+            if (batch_idx + 1) % (effective_accum * 10) == 0:
+                print(f"  Batch {batch_idx+1}/{len(loader)}: Loss={loss.item()*effective_accum:.4f}, GradNorm={compute_gradnorm(model, running_grad_norm):.4f}")
+         
+        running_samples += targets.size(0)
+        batch_losses.append(loss.item() * effective_accum)
+        batch_accuracies.append(accuracy.cpu().item() if torch.is_tensor(accuracy) else accuracy)
+        batch_ious.append(iou.cpu().item() if torch.is_tensor(iou) else iou)
+    
+    if len(loader) % effective_accum != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+
+    batch_losses = np.array(batch_losses)
+    batch_accuracies = np.array(batch_accuracies)
+    batch_ious = np.array(batch_ious)
+    avg_loss = np.mean(batch_losses)
+    avg_acc = np.mean(batch_accuracies)
+    avg_iou = np.mean(batch_ious)
+    std_loss = np.std(batch_losses)
+    std_acc = np.std(batch_accuracies)
+    std_iou = np.std(batch_ious)
+    avg_grad_norm = running_grad_norm / (batch_idx + 1)
+     
+    writer.add_scalar("GradNorm/train", avg_grad_norm, epoch)
+    
+    return avg_loss, avg_acc, avg_iou, std_loss, std_acc, std_iou
+
+def test(model, loader, criterion, device):
+    model.eval()
+    metricss = {}
+    index = 0
+
+    batch_losses = []
+    batch_ious_floods = []
+    batch_ious_non_floods = []
+    batch_accs_floods = []
+    batch_accs_non_floods = []
+    
+    with torch.no_grad():
+        for batch_data in loader:
+
+            sar_imgs, optical_imgs, elevation_imgs, masks, water_occur = batch_data
+            
+            # Send to device
+            sar_imgs = sar_imgs.to(device, non_blocking=True)
+            optical_imgs = optical_imgs.to(device, non_blocking=True)
+            elevation_imgs = elevation_imgs.to(device, non_blocking=True)
+            water_occur = water_occur.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+            
+            # Pass different modalities to different streams
+            predictions = model(sar_imgs, optical_imgs, elevation_imgs, water_occur)
+            # predictions = model(optical_imgs, elevation_imgs) # for EvaNet
+ 
+            targets = masks.squeeze(1).long() if len(masks.shape) > 3 else masks.long()
+
+ 
+            criterion_wrapped = criterion
+            loss = criterion_wrapped(predictions, targets)
+            metrics = computeMetrics(predictions, masks, device, criterion_wrapped)
+
+
+            metricss = {k: metricss.get(k, 0) + v for k, v in metrics.items()}
+
+            TP_batch = metrics['TP'].item()
+            FP_batch = metrics['FP'].item()
+            TN_batch = metrics['TN'].item()
+            FN_batch = metrics['FN'].item()
+
+            iou_floods_batch = TP_batch / (TP_batch + FN_batch + FP_batch) if (TP_batch + FN_batch + FP_batch) > 0 else 0
+            iou_non_floods_batch = TN_batch / (TN_batch + FP_batch + FN_batch) if (TN_batch + FP_batch + FN_batch) > 0 else 0
+            acc_floods_batch = TP_batch / (TP_batch + FN_batch) if (TP_batch + FN_batch) > 0 else 0
+            acc_non_floods_batch = TN_batch / (TN_batch + FP_batch) if (TN_batch + FP_batch) > 0 else 0
+
+            batch_losses.append(metrics['loss'])
+            batch_ious_floods.append(iou_floods_batch)
+            batch_ious_non_floods.append(iou_non_floods_batch)
+            batch_accs_floods.append(acc_floods_batch)
+            batch_accs_non_floods.append(acc_non_floods_batch)
+            
+            index += 1
+    
+    batch_losses = np.array(batch_losses)
+    batch_ious_floods = np.array(batch_ious_floods)
+    batch_ious_non_floods = np.array(batch_ious_non_floods)
+    batch_accs_floods = np.array(batch_accs_floods)
+    batch_accs_non_floods = np.array(batch_accs_non_floods)
+    TP, FP, TN, FN, loss = metricss['TP'].item(), metricss['FP'].item(), metricss['TN'].item(), metricss['FN'].item(), metricss['loss']
+    
+    IOU_floods = TP / (TP + FN + FP) if (TP + FN + FP) > 0 else 0
+    IOU_non_floods = TN / (TN + FP + FN) if (TN + FP + FN) > 0 else 0
+    Avg_IOU = (IOU_floods + IOU_non_floods) / 2
+
+    ACC_floods = TP / (TP + FN) if (TP + FN) > 0 else 0
+    ACC_non_floods = TN / (TN + FP) if (TN + FP) > 0 else 0
+    Avg_ACC = (ACC_floods + ACC_non_floods) / 2
+
+    batch_avg_iou = (batch_ious_floods + batch_ious_non_floods) / 2
+    batch_avg_acc = (batch_accs_floods + batch_accs_non_floods) / 2
+
+    return {
+        'IOU_floods': IOU_floods,
+        'IOU_non_floods': IOU_non_floods,
+        'Avg_IOU': Avg_IOU,
+        'ACC_floods': ACC_floods,
+        'ACC_non_floods': ACC_non_floods,
+        'Avg_ACC': Avg_ACC,
+        'Loss': loss / index,
+        'std_Loss': np.std(batch_losses),
+        'std_IOU_floods': np.std(batch_ious_floods),
+        'std_IOU_non_floods': np.std(batch_ious_non_floods),
+        'std_Avg_IOU': np.std(batch_avg_iou),
+        'std_ACC_floods': np.std(batch_accs_floods),
+        'std_ACC_non_floods': np.std(batch_accs_non_floods),
+        'std_Avg_ACC': np.std(batch_avg_acc),
+    }
+
+def ph_loop(model, train_loader, valid_loader, criterion, device, writer, scheduler, optimizer, model_dir, args):
+    
+    num_params_phase_n = get_number_of_trainable_parameters(model)
+
+    phase_metrics = {
+        'train_losses': [], 'train_accs': [], 'train_ious': [],
+        'std_losses': [], 'std_accs': [], 'std_ious': []
+    }
+
+    for epoch in range(args.epochs):
+        logger.info(f"\nEpoch {epoch+1}/{args.epochs}")
+        
+        train_loss, train_acc, train_iou, std_loss, std_acc, std_iou = train_model(
+            model, train_loader, optimizer, criterion, epoch, device, writer=writer
+        )
+        logger.info(f"Train - Loss: {train_loss:.4f} (±{std_loss:.4f}), Accuracy: {train_acc:.4f} (±{std_acc:.4f}), IoU: {train_iou:.4f} (±{std_iou:.4f})")
+        
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Accuracy/train", train_acc, epoch)
+        writer.add_scalar("IoU/train", train_iou, epoch)
+
+        writer.add_scalar("Loss_std/train", std_loss, epoch)
+        writer.add_scalar("Accuracy_std/train", std_acc, epoch)
+        writer.add_scalar("IoU_std/train", std_iou, epoch)
+
+        phase_metrics['train_losses'].append(train_loss)
+        phase_metrics['train_accs'].append(train_acc)
+        phase_metrics['train_ious'].append(train_iou)
+        phase_metrics['std_losses'].append(std_loss)
+        phase_metrics['std_accs'].append(std_acc)
+        phase_metrics['std_ious'].append(std_iou)
+        
+        scheduler.step()
+        
+        if (epoch + 1) % args.test_interval == 0:
+            val_metrics = test(model, valid_loader, criterion, device)
+            logger.info(f"Valid - Avg IOU: {val_metrics['Avg_IOU']:.4f} (±{val_metrics['std_Avg_IOU']:.4f}), "
+                        f"Avg ACC: {val_metrics['Avg_ACC']:.4f} (±{val_metrics['std_Avg_ACC']:.4f}), "
+                        f"Loss: {val_metrics['Loss']:.4f} (±{val_metrics['std_Loss']:.4f})")
+            
+            for metric_name, metric_value in val_metrics.items():
+                writer.add_scalar(f"{metric_name}/valid", metric_value, epoch)
+
+        # if model_dir and (epoch + 1) % 50 == 0:
+        #     checkpoint_path = os.path.join(model_dir, f"checkpoint_epoch_{epoch+1}.pt")
+        #     torch.save(model.state_dict(), checkpoint_path)
+        #     logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+    phase_summary = {
+        'mean_train_loss': float(np.mean(phase_metrics['train_losses'])),
+        'mean_train_acc': float(np.mean(phase_metrics['train_accs'])),
+        'mean_train_iou': float(np.mean(phase_metrics['train_ious'])),
+        'mean_std_loss': float(np.mean(phase_metrics['std_losses'])),
+        'mean_std_acc': float(np.mean(phase_metrics['std_accs'])),
+        'mean_std_iou': float(np.mean(phase_metrics['std_ious']))
+    }
+    logger.info(f"Phase Summary - Mean Loss: {phase_summary['mean_train_loss']:.4f} (±{phase_summary['mean_std_loss']:.4f}), "
+                f"Mean Acc: {phase_summary['mean_train_acc']:.4f} (±{phase_summary['mean_std_acc']:.4f}), "
+                f"Mean IoU: {phase_summary['mean_train_iou']:.4f} (±{phase_summary['mean_std_iou']:.4f})")
+
+    return num_params_phase_n
+
+def ft_loop(model, model_name, train_loader, valid_loader, criterion, device, writer, scheduler, optimizer, args):
+        logger.info(f"\nFine-tuning {model_name}")
+
+        num_params_phase_ft = get_number_of_trainable_parameters(model)
+        
+        finetune_epochs = int(args.epochs * args.finetune_ratio)
+        
+        finetune_lr = args.learning_rate * 0.1
+        optimizer = torch.optim.AdamW(model.parameters(), lr=finetune_lr)
+        scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, finetune_epochs)
+
+        ft_metrics = {
+            'train_losses': [], 'train_accs': [], 'train_ious': [],
+            'std_losses': [], 'std_accs': [], 'std_ious': []
+        }
+        
+        for epoch in range(args.epochs, args.epochs + finetune_epochs):
+            logger.info(f"\n{model_name} - Fine-tune Epoch {epoch+1}/{args.epochs + finetune_epochs}")
+             
+            train_loss, train_acc, train_iou, std_loss, std_acc, std_iou = train_model(model, train_loader, optimizer, criterion, epoch, device, writer=writer)
+            logger.info(f"Train - Loss: {train_loss:.4f} (±{std_loss:.4f}), Accuracy: {train_acc:.4f} (±{std_acc:.4f}), IoU: {train_iou:.4f} (±{std_iou:.4f})")
+            
+            writer.add_scalar("Loss/train", train_loss, epoch)
+            writer.add_scalar("Accuracy/train", train_acc, epoch)
+            writer.add_scalar("IoU/train", train_iou, epoch)
+
+            writer.add_scalar("Loss_std/train", std_loss, epoch)
+            writer.add_scalar("Accuracy_std/train", std_acc, epoch)
+            writer.add_scalar("IoU_std/train", std_iou, epoch)
+
+            ft_metrics['train_losses'].append(train_loss)
+            ft_metrics['train_accs'].append(train_acc)
+            ft_metrics['train_ious'].append(train_iou)
+            ft_metrics['std_losses'].append(std_loss)
+            ft_metrics['std_accs'].append(std_acc)
+            ft_metrics['std_ious'].append(std_iou)
+            
+            scheduler.step()
+            
+            if (epoch + 1) % args.test_interval == 0:
+                val_metrics = test(model, valid_loader, criterion, device)
+                logger.info(f"Valid - Avg IOU: {val_metrics['Avg_IOU']:.4f} (±{val_metrics['std_Avg_IOU']:.4f}), "
+                            f"Avg ACC: {val_metrics['Avg_ACC']:.4f} (±{val_metrics['std_Avg_ACC']:.4f}), "
+                            f"Loss: {val_metrics['Loss']:.4f} (±{val_metrics['std_Loss']:.4f})")
+                
+                for metric_name, metric_value in val_metrics.items():
+                    writer.add_scalar(f"{metric_name}/valid", metric_value, epoch)
+
+        return num_params_phase_ft
+
+def train(model, model_name, train_loader, valid_loader, test_loader, bolivia_loader, 
+                                   args, device, base_log_dir):    
+    model_log_dir = os.path.join(base_log_dir, model_name)
+    os.makedirs(model_log_dir, exist_ok=True)
+    model_dir = os.path.join(model_log_dir, 'models')
+    os.makedirs(model_dir, exist_ok=True)
+
+    num_params_phase_1 = "N/A"
+    num_params_phase_2 = "N/A"
+    num_params_phase_ft = "N/A"
+
+    writer = SummaryWriter(model_log_dir)
+    
+    num_params = get_number_of_trainable_parameters(model)
+    num_params_total = get_total_parameters(model)
+    logger.info(f"{model_name}| Total Params: {num_params_total}")
+
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    # optimizer = Lion(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
+    # optimizer = torch.optim.Muon(model.parameters(), lr=args.learning_rate)
+
+
+    if args.loss_func == 'diceloss':
+        criterion = DiceLoss(device=device)
+    elif args.loss_func == 'dl2':
+        criterion = DiceLoss2(device=device, epsilon=1e-7)
+    elif args.loss_func == 'wce':
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor([0.7, 0.3], device=device), ignore_index=255)
+    elif args.loss_func == 'focal':
+        criterion = FocalLoss(mode="multiclass", alpha=0.25, gamma=2, ignore_index=255, reduction='mean')
+    elif args.loss_func == 'lovasz':
+        criterion = LovaszLoss(mode='multiclass', per_image=False, from_logits=True, ignore_index=255)
+    elif args.loss_func == 'tversky':
+        criterion = TverskyLoss(mode='multiclass', alpha=0.3, beta=0.7, gamma=1.33, eps=1e-7, ignore_index=255, from_logits=True)
+
+    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, args.epochs)
+     
+    attention_based_model = ['DSUNet_Prithvi','DSUNet3P_Prithvi','HydraUNet_Prithvi','HydraUNet3P_Prithvi']
+    three_phase_model = ['DSUNet_EarlyFS', 'DSUNet_MiddleFS', 'DSUNet_LateFS']
+
+    # if model_name in attention_based_model and args.finetune_ratio is not None:
+    #     model.change_prithvi_trainability(False)
+    #     logger.info(f"Prithvi weights frozen. Trainable parameters: {get_number_of_trainable_parameters(model):,}")
+
+    # Full Phase 1
+    # if model_name in three_phase_model and args.finetune_ratio is not None:
+    #     model.change_s1_trainability(True) 
+    #     model.change_s2_trainability(False) # Freeze S2, update S1
+    #     # model.change_prithvi_trainability(False) # Freeze prithvi
+    #     logger.info(f"Module S2 frozen. Trainable parameters: {get_number_of_trainable_parameters(model):,}")
+
+    num_params_phase_1 = ph_loop(model, train_loader, valid_loader, criterion, device, writer, scheduler, optimizer, model_dir, args)
+    torch.cuda.empty_cache()
+
+    # Full Phase 2
+    # if model_name in three_phase_model and args.finetune_ratio is not None:
+    #     model.change_s1_trainability(False) # Freeze S1, update S2
+    #     model.change_s2_trainability(True)
+    #     logger.info(f"Module S1 frozen. Trainable parameters: {get_number_of_trainable_parameters(model):,}")
+    # num_params_phase_2 = ph_loop(model, train_loader, valid_loader, criterion, device, writer, scheduler, optimizer, model_dir, args)
+    # torch.cuda.empty_cache()
+
+    # FT Phase 3
+    # if model_name in three_phase_model and args.finetune_ratio is not None:
+    #     model.change_s1_trainability(True)
+    #     model.change_s2_trainability(True)
+    #     # model.change_prithvi_trainability(True) # Unfreeze Prithvi
+    #     logger.info(f"All weights unfrozen. Trainable parameters: {get_number_of_trainable_parameters(model):,}")
+    #     num_params_phase_ft = ft_loop(model, model_name, train_loader, valid_loader, criterion, device, writer, scheduler, optimizer, model_dir, args)
+
+
+
+    # FT Phase Prithvi
+    # if model_name in attention_based_model and args.finetune_ratio is not None:
+    #     model.change_prithvi_trainability(True)
+    #     logger.info(f"Prithvi weights unfrozen. Trainable parameters: {get_number_of_trainable_parameters(model):,}")
+    #     num_params_phase_ft = ft_loop(model, model_name, train_loader, valid_loader, criterion, device, writer, scheduler, optimizer, args)
+    
+    logger.info(f"\nFinal Evaluation")
+    
+    test_metrics = test(model, test_loader, criterion, device)
+    bolivia_metrics = test(model, bolivia_loader, criterion, device)
+    
+    logger.info(f"Test Set - Avg IOU: {test_metrics['Avg_IOU']:.4f} (±{test_metrics['std_Avg_IOU']:.4f}), Avg ACC: {test_metrics['Avg_ACC']:.4f} (±{test_metrics['std_Avg_ACC']:.4f}), Loss: {test_metrics['Loss']:.4f} (±{test_metrics['std_Loss']:.4f})")
+    logger.info(f"Bolivia Set - Avg IOU: {bolivia_metrics['Avg_IOU']:.4f} (±{bolivia_metrics['std_Avg_IOU']:.4f}), Avg ACC: {bolivia_metrics['Avg_ACC']:.4f} (±{bolivia_metrics['std_Avg_ACC']:.4f}), Loss: {bolivia_metrics['Loss']:.4f} (±{bolivia_metrics['std_Loss']:.4f})")
+    
+    writer.close()
+    
+    torch.save(model.state_dict(), os.path.join(model_dir, f"model_final.pt"))
+    
+    return {
+        'model_name': model_name,
+        'num_trainable_params': num_params,
+        'num_total_params': num_params_total,
+        'params_phase_1': num_params_phase_1,
+        'params_phase_2': num_params_phase_2,
+        'params_pahse_ft': num_params_phase_ft,
+        'test_metrics': test_metrics,
+        'bolivia_metrics': bolivia_metrics
+    }
+
+
+def aggregate_seed_results(all_seed_results):
+ 
+    model_metrics = defaultdict(lambda: defaultdict(list))
+    model_meta   = {}   
+
+    METRIC_SPLITS = ['test_metrics', 'bolivia_metrics']
+ 
+    SKIP_PREFIX = 'std_'
+
+    for seed_entry in all_seed_results:
+        for result in seed_entry['results']:
+            model_name = result['model_name']
+ 
+            if model_name not in model_meta:
+                model_meta[model_name] = {
+                    'num_trainable_params': result.get('num_trainable_params'),
+                    'num_total_params':     result.get('num_total_params'),
+                    'params_phase_1':       result.get('params_phase_1'),
+                    'params_phase_2':       result.get('params_phase_2'),
+                    'params_phase_ft':      result.get('params_pahse_ft'),   
+                }
+
+            for split in METRIC_SPLITS:
+                for metric, value in result[split].items():
+                    if not metric.startswith(SKIP_PREFIX):
+                        key = f"{split}/{metric}"
+                        model_metrics[model_name][key].append(float(value))
+
+    aggregated = []
+    for model_name, metrics in model_metrics.items():
+        entry = {
+            'model_name': model_name,
+            'num_seeds':  len(all_seed_results),
+            **model_meta[model_name],
+        }
+
+        for key, values in metrics.items():
+            arr = np.array(values)
+            entry[f"{key}/mean"]   = float(np.mean(arr))
+            entry[f"{key}/std"]    = float(np.std(arr))
+            entry[f"{key}/values"] = values   
+
+        aggregated.append(entry)
+
+    return aggregated
+
+
+def main(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device('mps') if torch.backends.mps.is_available() else device
+    multiprocessing.set_start_method('fork')
+    logger.info(f'Using device: {device}')
+    
+    logger.info("Loading datasets...")
+
+    seeds = [124, 42, 12, 114, 28] if args.full_seed else [124]
+    all_seed_results = []  
+
+    for s in seeds:
+        random.seed(s)
+        torch.manual_seed(s)
+        np.random.seed(s)
+        
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+        args.version = f"{args.version}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        base_log_dir = f'./logs/Multimodal_{args.epochs}E_{args.loss_func.upper()}_{s}'
+        os.makedirs(base_log_dir, exist_ok=True)
+
+        train_loader   = get_loader_MM(args.data_path, DatasetType.TRAIN.value,   args)
+        valid_loader   = get_loader_MM(args.data_path, DatasetType.VALID.value,   args)
+        test_loader    = get_loader_MM(args.data_path, DatasetType.TEST.value,    args)
+        second_test_loader = get_loader_MM(args.data_path, DatasetType.BOLIVIA.value, args)
+
+        baseline = {
+            "UNet_Sentinel2": UNet(
+                in_channels=6,
+                out_channels=2,
+                unet_encoder_size=768
+            ),
+            "UNet3+_Sentinel2": UNet3Plus(
+                cfg=Config_Unet3P,
+                n_channels=6,
+                n_classes=2,
+                scheme="single_cnn"
+            ),
+            "DeeplabV3_Resnet50_Sentinel2": DeepLabWrapper(deeplabv3_resnet50(num_classes=2), in_channels=6),
+            "DeeplabV3_MobilenetV2Large_Sentinel2": DeepLabWrapper(deeplabv3_mobilenet_v3_large(num_classes=2), in_channels=6),
+            "Attention_GhostUNetPlusPlus_Sentinel2": Ghost_Unet(
+                in_ch=6,
+                out_ch=2
+            ),
+            "Fast_SCNN_Sentinel2": FastSCNN(
+                in_channels=6,
+                num_classes=2
+            )
+            # "UNet_NPTN": ENet(
+            #     cfg=Config_Unet,
+            #     backbone="prc"
+            # ),
+            # "UNet_DoubleConv": ENet(
+            #     cfg=Config_Unet,
+            #     backbone="double_cnn"
+            # ),
+            # "UNet_SingleConv": ENet(
+            #     cfg=Config_Unet,
+            #     backbone="single_cnn"
+            # ),
+            # "UNet_GhostNet": ENet(
+            #     cfg=Config_Unet,
+            #     backbone="ghost"
+            # ),
+            
+        }
+
+        if args.run_baseline:
+            models = baseline
+        else:
+            models = {
+                "UNet_3Plus_GHOST": UNet3Plus(
+                    cfg=Config_Unet3P,
+                    n_channels=6,
+                    n_classes=2,
+                    scheme="ghost"
+                )
+            }
+
+        seed_results = []
+        for model_name, model in models.items():
+            model.to(device)
+            result = train(
+                model, model_name, train_loader, valid_loader, test_loader, second_test_loader, 
+                args, device, base_log_dir
+            )
+            torch.cuda.empty_cache()
+            del model
+            seed_results.append(result)
+ 
+        results_file = os.path.join(base_log_dir, f'multimodal_e{args.epochs}_{args.loss_func}.json')
+        with open(results_file, 'w') as f:
+            json.dump(seed_results, f, indent=4, default=float)
+        logger.info(f"Seed {s} results saved to: {results_file}")
+ 
+        all_seed_results.append({'seed': s, 'results': seed_results})
+
+ 
+    aggregated = aggregate_seed_results(all_seed_results)
+ 
+    agg_dir  = './logs'
+    agg_file = os.path.join(
+        agg_dir,
+        f'multimodal_e{args.epochs}_{args.loss_func}_all_seeds.json'
+    )
+    os.makedirs(agg_dir, exist_ok=True)
+    with open(agg_file, 'w') as f:
+        json.dump(aggregated, f, indent=4, default=float)
+    logger.info(f"\nAggregated cross-seed results saved to: {agg_file}")
+ 
+    for entry in aggregated:
+        logger.info(f"\nModel: {entry['model_name']}  (n={entry['num_seeds']} seeds)")
+        for split in ['test_metrics', 'bolivia_metrics']:
+            logger.info(f"  [{split}]")
+            for metric in ['Avg_IOU', 'Avg_ACC', 'Loss']:
+                key = f"{split}/{metric}"
+                if f"{key}/mean" in entry:
+                    logger.info(
+                        f"    {metric}: {entry[f'{key}/mean']:.4f} ± {entry[f'{key}/std']:.4f}  "
+                        f"(values: {[round(v,4) for v in entry[f'{key}/values']]})"
+                    )
+
+
+if __name__ == '__main__':
+    args = parse_arguments()
+    main(args)
