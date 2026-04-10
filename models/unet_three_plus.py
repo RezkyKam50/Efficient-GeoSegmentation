@@ -2,33 +2,12 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 
-from models.networks.GhostNet import GhostModule
+from models.networks.GhostNet import GhostModule, GhostBottleneck
 from models.networks.PRCNPTN import PRCNPTNLayer
-
-from neuralop.models import TFNO
-
-
-class FNO(nn.Module):
-    def __init__(self, in_channels, out_channels, img_size):
-        super(FNO, self).__init__()
-        
-        self.model = TFNO(
-            n_modes=(img_size // 4, img_size // 4),  # Reduced for efficiency
-            hidden_channels=in_channels,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            factorization='tucker',
-            implementation='factorized',
-            rank=0.1
-        )
-        
-    def forward(self, x):
-        # x shape: (B, C, H, W)
-        return self.model(x)
 
 
 class conv_block(nn.Module):
-    def __init__(self, in_ch, out_ch, scheme="single_cnn"):
+    def __init__(self, in_ch, out_ch, scheme="ghost"):
         super(conv_block, self).__init__()
         self.scheme = scheme
 
@@ -36,10 +15,10 @@ class conv_block(nn.Module):
             self.conv = nn.Sequential(
                 GhostModule(in_ch, out_ch, kernel_size=1, ratio=2, relu=False),
                 nn.BatchNorm2d(out_ch),
-                nn.ReLU6(inplace=True),
+                nn.ReLU(inplace=True),
                 GhostModule(out_ch, out_ch, kernel_size=1, ratio=2, relu=False),
                 nn.BatchNorm2d(out_ch),
-                nn.ReLU6(inplace=True)
+                nn.ReLU(inplace=True)
             )
         elif scheme == "double_cnn":
             self.conv = nn.Sequential(
@@ -50,40 +29,40 @@ class conv_block(nn.Module):
                 nn.BatchNorm2d(out_ch),
                 nn.ReLU(inplace=True)
             )
-        elif scheme == "single_cnn":
-            self.conv = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 3, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            )
         elif scheme == "prc":
-            self.proj = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-            self.bn_proj = nn.BatchNorm2d(out_ch)
-            self.prc = PRCNPTNLayer(
-                inch=out_ch,    
-                outch=out_ch,
-                G=10,
-                CMP=2,
-                kernel_size=3,
-                padding=1
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                PRCNPTNLayer(
+                    inch=out_ch,
+                    outch=out_ch,
+                    G=10,
+                    CMP=2,
+                    kernel_size=3,
+                    padding=1
+                )
             )
- 
-            self.act2 = nn.ReLU(inplace=True)
+            self.shortcut = (
+                nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                    nn.BatchNorm2d(out_ch)
+                )
+                if in_ch != out_ch else nn.Identity()
+            )
 
     def forward(self, x):
-
         if self.scheme == "prc":
-            x = self.proj(x)
-            x = self.bn_proj(x)   
-            x = self.prc(x)
-            x = self.act2(x)
-            return x
+            identity = self.shortcut(x)   
+            x = self.conv(x)
+            x = x + identity
+            x = F.relu(x)
         else:
-            return self.conv(x)
+            x = self.conv(x)
+        return x
 
 
 class encoder_block(nn.Module):
-    def __init__(self, in_c, out_c, scheme="double_cnn"):
+    def __init__(self, in_c, out_c, scheme):
         super().__init__()
         self.c1 = nn.Sequential(
             conv_block(in_c, out_c, scheme=scheme),
@@ -107,20 +86,18 @@ class OutConv(nn.Module):
 
 
 class UNet3Plus(nn.Module):
-    def __init__(self, cfg, n_channels=None, n_classes=None, enable_outc=True, scheme="double_cnn"):
+    def __init__(self, cfg, n_channels=None, n_classes=None, deep_sup=False, scheme="ghost"):
         super().__init__()
 
         self._cfg = cfg
         n_channels = cfg.MODEL.IN_CHANNELS if n_channels is None else n_channels
         n_classes = cfg.MODEL.OUT_CHANNELS if n_classes is None else n_classes
+        self.deep_sup = deep_sup
 
         if hasattr(cfg.MODEL, 'TOPOLOGY'):
             topology = cfg.MODEL.TOPOLOGY
             f1, f2, f3, f4, f5 = topology
-        else:
-            f1, f2, f3, f4, f5 = 64, 128, 256, 512, 1024
-
-        self.enable_outc = enable_outc
+ 
 
         self.e1 = encoder_block(n_channels, f1, scheme=scheme)
         self.e2 = encoder_block(f1, f2, scheme=scheme)
@@ -162,10 +139,14 @@ class UNet3Plus(nn.Module):
         self.e5_d1 = conv_block(f5, self.reduction_channels, scheme=scheme)
         self.d1 = conv_block(self.reduction_channels * 5, self.reduction_channels, scheme=scheme)
 
-        if enable_outc:
+        if deep_sup == True:
             self.y1 = nn.Conv2d(self.reduction_channels, n_classes, kernel_size=3, padding=1)
+            self.y2 = nn.Conv2d(self.reduction_channels, n_classes, kernel_size=3, padding=1)
+            self.y3 = nn.Conv2d(self.reduction_channels, n_classes, kernel_size=3, padding=1)
+            self.y4 = nn.Conv2d(self.reduction_channels, n_classes, kernel_size=3, padding=1)
+            self.y5 = nn.Conv2d(f5, n_classes, kernel_size=3, padding=1)
         else:
-            self.y1 = nn.Identity()
+            self.y1 = nn.Conv2d(self.reduction_channels, n_classes, kernel_size=3, padding=1)
 
     def encode(self, inputs):
         e1, p1 = self.e1(inputs)
@@ -250,7 +231,16 @@ class UNet3Plus(nn.Module):
         d1 = torch.cat([e1_d1, e2_d1, e3_d1, e4_d1, e5_d1], dim=1)
         d1 = self.d1(d1)
 
-        return self.y1(d1)
+        if self.deep_sup == True:
+            y1 = self.y1(d1)
+            y2 = F.interpolate(self.y2(d2), scale_factor=2, mode="bilinear", align_corners=True)
+            y3 = F.interpolate(self.y3(d3), scale_factor=4, mode="bilinear", align_corners=True)
+            y4 = F.interpolate(self.y4(d4), scale_factor=8, mode="bilinear", align_corners=True)
+            y5 = F.interpolate(self.y5(e5), scale_factor=16, mode="bilinear", align_corners=True)
+            return (y1, y2, y3, y4, y5)
+        else:
+            y1 = self.y1(d1)
+            return y1
 
     def forward(self, sar=None, optical=None, dem=None, pw=None):
         

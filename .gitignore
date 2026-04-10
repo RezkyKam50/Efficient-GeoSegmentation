@@ -2,3 +2,4 @@
 datasets/sen1floods11*
 logs
 __pycache__
+*.json

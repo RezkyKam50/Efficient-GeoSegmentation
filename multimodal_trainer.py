@@ -5,12 +5,15 @@ from torchvision.models.segmentation import (
     deeplabv3_resnet50, 
     deeplabv3_mobilenet_v3_large
 )
-
 from models.deeplab import DeepLabWrapper
+
 from models.UNet import UNet
 from models.unet_three_plus import UNet3Plus
 from models.attn_ghostnet import Ghost_Unet
 from models.fast_scnn import FastSCNN
+from models.vm_unet import VMUNet
+from models.h_vmunet import H_vmunet
+
 
 from models.networks.E_Net import ENet
 
@@ -99,7 +102,7 @@ def compute_gradnorm(model, running_grad_norm):
 
     return total_norm
 
-def train_model(model, loader, optimizer, criterion, epoch, device, writer=None):
+def train_model(model, loader, optimizer, criterion, epoch, device, writer=None, deep_sup_loss=True):
     model.train()
     running_samples = 0
     running_grad_norm = 0.0
@@ -107,41 +110,55 @@ def train_model(model, loader, optimizer, criterion, epoch, device, writer=None)
     batch_accuracies = []
     batch_ious = []
     optimizer.zero_grad()
- 
     effective_accum = args.grad_accumulation if args.grad_accumulation is not None else 1
-    
+
+    # Deep supervision weights (main output weighted highest, aux outputs lower)
+    # These should sum to 1.0 and decrease for deeper supervision outputs
+    ds_weights = [0.5, 0.2, 0.15, 0.1, 0.05]  # y1, y2, y3, y4, y5
+
     for batch_idx, batch_data in enumerate(tqdm(loader, desc=f"Training Epoch {epoch+1}"), 0):
         sar_imgs, optical_imgs, elevation_imgs, masks, water_occur = batch_data
- 
         sar_imgs = sar_imgs.to(device, non_blocking=True)
         optical_imgs = optical_imgs.to(device, non_blocking=True)
         elevation_imgs = elevation_imgs.to(device, non_blocking=True)
         water_occur = water_occur.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
-              
+
         with autocast(device_type="cuda", dtype=torch.bfloat16 if args.mixed_precision else torch.float32):
             outputs = model(sar_imgs, optical_imgs, elevation_imgs, water_occur)
-           
             targets = masks.squeeze(1) if len(masks.shape) > 3 else masks
-            loss = criterion(outputs, targets.long()) / effective_accum
+
+            # deep supervision loss 
+            if deep_sup_loss and isinstance(outputs, (tuple, list)):
+                loss = sum(
+                    w * criterion(out.float(), targets.long())
+                    for w, out in zip(ds_weights, outputs)
+                ) / effective_accum
             
+                primary_output = outputs[0]
+            else:
+              
+                primary_output = outputs 
+                loss = criterion(primary_output, targets.long()) / effective_accum
+
         loss.backward()
-         
-        iou = computeIOU(outputs.float(), targets, device)
-        accuracy = computeAccuracy(outputs.float(), targets, device)
-         
+
+        # Metrics computed only on the primary (full-res) output
+        iou = computeIOU(primary_output.float(), targets, device)
+        accuracy = computeAccuracy(primary_output.float(), targets, device)
+
         if (batch_idx + 1) % effective_accum == 0:
             optimizer.step()
             optimizer.zero_grad()
-             
-            if (batch_idx + 1) % (effective_accum * 10) == 0:
-                print(f"  Batch {batch_idx+1}/{len(loader)}: Loss={loss.item()*effective_accum:.4f}, GradNorm={compute_gradnorm(model, running_grad_norm):.4f}")
-         
+
+        if (batch_idx + 1) % (effective_accum * 10) == 0:
+            print(f"  Batch {batch_idx+1}/{len(loader)}: Loss={loss.item()*effective_accum:.4f}, GradNorm={compute_gradnorm(model, running_grad_norm):.4f}")
+
         running_samples += targets.size(0)
         batch_losses.append(loss.item() * effective_accum)
         batch_accuracies.append(accuracy.cpu().item() if torch.is_tensor(accuracy) else accuracy)
         batch_ious.append(iou.cpu().item() if torch.is_tensor(iou) else iou)
-    
+
     if len(loader) % effective_accum != 0:
         optimizer.step()
         optimizer.zero_grad()
@@ -156,9 +173,8 @@ def train_model(model, loader, optimizer, criterion, epoch, device, writer=None)
     std_acc = np.std(batch_accuracies)
     std_iou = np.std(batch_ious)
     avg_grad_norm = running_grad_norm / (batch_idx + 1)
-     
     writer.add_scalar("GradNorm/train", avg_grad_norm, epoch)
-    
+
     return avg_loss, avg_acc, avg_iou, std_loss, std_acc, std_iou
 
 def test(model, loader, criterion, device):
@@ -187,6 +203,9 @@ def test(model, loader, criterion, device):
             # Pass different modalities to different streams
             predictions = model(sar_imgs, optical_imgs, elevation_imgs, water_occur)
             # predictions = model(optical_imgs, elevation_imgs) # for EvaNet
+
+            # handle deep sup return
+            predictions = predictions[0] if isinstance(predictions, (tuple, list)) else predictions
  
             targets = masks.squeeze(1).long() if len(masks.shape) > 3 else masks.long()
 
@@ -542,25 +561,33 @@ def main(args):
         second_test_loader = get_loader_MM(args.data_path, DatasetType.BOLIVIA.value, args)
 
         baseline = {
-            "UNet_Sentinel2": UNet(
-                in_channels=6,
-                out_channels=2,
-                unet_encoder_size=768
+            # "UNet_Sentinel2": UNet(
+            #     in_channels=6,
+            #     out_channels=2,
+            #     unet_encoder_size=768
+            # ),
+            # "UNet3+_Sentinel2": UNet3Plus(
+            #     cfg=Config_Unet3P,
+            #     n_channels=6,
+            #     n_classes=2,
+            #     scheme="single_cnn"
+            # ),
+            # "DeeplabV3_Resnet50_Sentinel2": DeepLabWrapper(deeplabv3_resnet50(num_classes=2), in_channels=6),
+            # "DeeplabV3_MobilenetV2Large_Sentinel2": DeepLabWrapper(deeplabv3_mobilenet_v3_large(num_classes=2), in_channels=6),
+            # "Attention_GhostUNetPlusPlus_Sentinel2": Ghost_Unet(
+            #     in_ch=6,
+            #     out_ch=2
+            # ),
+            # "Fast_SCNN_Sentinel2": FastSCNN(
+            #     in_channels=6,
+            #     num_classes=2
+            # ),
+            "VMUnet_Sentinel2": VMUNet(
+                input_channels=6,
+                num_classes=2
             ),
-            "UNet3+_Sentinel2": UNet3Plus(
-                cfg=Config_Unet3P,
-                n_channels=6,
-                n_classes=2,
-                scheme="single_cnn"
-            ),
-            "DeeplabV3_Resnet50_Sentinel2": DeepLabWrapper(deeplabv3_resnet50(num_classes=2), in_channels=6),
-            "DeeplabV3_MobilenetV2Large_Sentinel2": DeepLabWrapper(deeplabv3_mobilenet_v3_large(num_classes=2), in_channels=6),
-            "Attention_GhostUNetPlusPlus_Sentinel2": Ghost_Unet(
-                in_ch=6,
-                out_ch=2
-            ),
-            "Fast_SCNN_Sentinel2": FastSCNN(
-                in_channels=6,
+            "H_vmunet_Sentinel2": H_vmunet(
+                input_channels=6,
                 num_classes=2
             )
             # "UNet_NPTN": ENet(
@@ -586,11 +613,12 @@ def main(args):
             models = baseline
         else:
             models = {
-                "UNet_3Plus_GHOST": UNet3Plus(
+                "UNet_3Plus_Ghost_DeepSup": UNet3Plus(
                     cfg=Config_Unet3P,
                     n_channels=6,
                     n_classes=2,
-                    scheme="ghost"
+                    scheme="ghost",
+                    deep_sup=True
                 )
             }
 
