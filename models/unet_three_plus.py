@@ -4,12 +4,16 @@ import torch.nn as nn
 
 from models.networks.GhostNet import GhostModule, GhostBottleneck
 from models.networks.PRCNPTN import PRCNPTNLayer
+from models.networks.VSS2D import VSSBlock
 
+
+from models.networks.DeepSupUncert import UncertaintyWeightedDSLoss
 
 class conv_block(nn.Module):
-    def __init__(self, in_ch, out_ch, scheme="ghost"):
+    def __init__(self, in_ch, out_ch, scheme="ghost", dropout=0):
         super(conv_block, self).__init__()
         self.scheme = scheme
+        self.dropout = dropout
 
         if scheme == "ghost":
             self.conv = nn.Sequential(
@@ -49,6 +53,10 @@ class conv_block(nn.Module):
                 )
                 if in_ch != out_ch else nn.Identity()
             )
+        elif scheme == "vss2d":
+            self.conv = nn.Sequential(
+                VSSBlock(in_ch=in_ch, out_ch=out_ch, depth=1)
+            )
 
     def forward(self, x):
         if self.scheme == "prc":
@@ -58,6 +66,10 @@ class conv_block(nn.Module):
             x = F.relu(x)
         else:
             x = self.conv(x)
+        
+        if self.dropout > 0:
+            x = F.dropout(x, p=self.dropout)
+            
         return x
 
 
@@ -86,7 +98,7 @@ class OutConv(nn.Module):
 
 
 class UNet3Plus(nn.Module):
-    def __init__(self, cfg, n_channels=None, n_classes=None, deep_sup=False, scheme="ghost"):
+    def __init__(self, cfg, n_channels=None, n_classes=None, deep_sup=False, bayes_loss=False ,scheme="ghost"):
         super().__init__()
 
         self._cfg = cfg
@@ -94,16 +106,22 @@ class UNet3Plus(nn.Module):
         n_classes = cfg.MODEL.OUT_CHANNELS if n_classes is None else n_classes
         self.deep_sup = deep_sup
 
+
         if hasattr(cfg.MODEL, 'TOPOLOGY'):
             topology = cfg.MODEL.TOPOLOGY
             f1, f2, f3, f4, f5 = topology
- 
+
+        if bayes_loss:
+            self.ds_loss = UncertaintyWeightedDSLoss(num_outputs=len(topology))
+        else:
+            self.ds_loss = None
 
         self.e1 = encoder_block(n_channels, f1, scheme=scheme)
         self.e2 = encoder_block(f1, f2, scheme=scheme)
         self.e3 = encoder_block(f2, f3, scheme=scheme)
         self.e4 = encoder_block(f3, f4, scheme=scheme)
 
+  
         self.e5 = nn.Sequential(
             conv_block(f4, f5, scheme=scheme),
             conv_block(f5, f5, scheme=scheme)
@@ -147,6 +165,7 @@ class UNet3Plus(nn.Module):
             self.y5 = nn.Conv2d(f5, n_classes, kernel_size=3, padding=1)
         else:
             self.y1 = nn.Conv2d(self.reduction_channels, n_classes, kernel_size=3, padding=1)
+
 
     def encode(self, inputs):
         e1, p1 = self.e1(inputs)

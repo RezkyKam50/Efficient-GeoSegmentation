@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torchvision.models.segmentation import (
     deeplabv3_resnet50, 
@@ -21,6 +22,7 @@ from segmentation_models_pytorch.losses import FocalLoss, LovaszLoss
  
 from utils.tversky import TverskyLoss
 from utils.customloss import DiceLoss, DiceLoss2 
+from utils.cwmi_loss import CWMI_loss
 
 from models.networks.config import (
     Config_Unet,  
@@ -86,11 +88,6 @@ def get_number_of_trainable_parameters(model):
 def get_total_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
-
-def is_boundary_conv(name):
-    return any(k in name for k in ["inc.", "outc.", "out_conv.", "up_seq"])  # inc=input, outc/out_conv=output, ConvTranspose in up_seq
-
-
 def compute_gradnorm(model, running_grad_norm):
     total_norm = 0.0
     for p in model.parameters():
@@ -102,7 +99,7 @@ def compute_gradnorm(model, running_grad_norm):
 
     return total_norm
 
-def train_model(model, loader, optimizer, criterion, epoch, device, writer=None, deep_sup_loss=True):
+def train_model(model, loader, optimizer, criterion, epoch, device, writer=None, deep_sup_loss=True, bayesian_loss=True):
     model.train()
     running_samples = 0
     running_grad_norm = 0.0
@@ -112,9 +109,7 @@ def train_model(model, loader, optimizer, criterion, epoch, device, writer=None,
     optimizer.zero_grad()
     effective_accum = args.grad_accumulation if args.grad_accumulation is not None else 1
 
-    # Deep supervision weights (main output weighted highest, aux outputs lower)
-    # These should sum to 1.0 and decrease for deeper supervision outputs
-    ds_weights = [0.5, 0.2, 0.15, 0.1, 0.05]  # y1, y2, y3, y4, y5
+    
 
     for batch_idx, batch_data in enumerate(tqdm(loader, desc=f"Training Epoch {epoch+1}"), 0):
         sar_imgs, optical_imgs, elevation_imgs, masks, water_occur = batch_data
@@ -130,11 +125,14 @@ def train_model(model, loader, optimizer, criterion, epoch, device, writer=None,
 
             # deep supervision loss 
             if deep_sup_loss and isinstance(outputs, (tuple, list)):
-                loss = sum(
-                    w * criterion(out.float(), targets.long())
-                    for w, out in zip(ds_weights, outputs)
-                ) / effective_accum
-            
+                if bayesian_loss:
+                    loss = model.ds_loss(outputs, targets.long(), criterion) / effective_accum
+                else:
+                    loss = sum(
+                        w * criterion(out.float(), targets.long())
+                        for w, out in zip([0.5, 0.2, 0.15, 0.1, 0.05], outputs)
+                    ) / effective_accum
+
                 primary_output = outputs[0]
             else:
               
@@ -176,6 +174,33 @@ def train_model(model, loader, optimizer, criterion, epoch, device, writer=None,
     writer.add_scalar("GradNorm/train", avg_grad_norm, epoch)
 
     return avg_loss, avg_acc, avg_iou, std_loss, std_acc, std_iou
+
+
+def mc_dropout_predict(model, sar, optical, elevation, water_occur, T=20):
+
+    enable_mc_dropout(model)
+
+    preds = []
+    with torch.no_grad():
+        for _ in range(T):
+            out = model(sar, optical, elevation, water_occur)
+            if isinstance(out, (tuple, list)):
+                out = out[0]
+            preds.append(out)
+
+    preds = torch.stack(preds, dim=0)  # [T, B, C, H, W]
+
+    mean = preds.mean(dim=0)
+    var = preds.var(dim=0)
+
+    return mean, var
+
+def enable_mc_dropout(model):
+    for m in model.modules():
+        if isinstance(m, (nn.Dropout, F.dropout)):
+            m.train()
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()  # freeze BN stats
 
 def test(model, loader, criterion, device):
     model.eval()
@@ -399,8 +424,24 @@ def train(model, model_name, train_loader, valid_loader, test_loader, bolivia_lo
     num_params_total = get_total_parameters(model)
     logger.info(f"{model_name}| Total Params: {num_params_total}")
 
+    if model.ds_loss is not None:
+        ds_params = list(model.ds_loss.parameters())
+        ds_param_ids = {id(p) for p in ds_params}
+        main_params = [p for p in model.parameters() if id(p) not in ds_param_ids]
+        
+        train_p = [
+            {'params': main_params, 'lr': args.learning_rate},
+            {'params': ds_params, 'lr': args.learning_rate}   
+        ]
+        logger.info("Uncertainty loss used")
+    else:
+        train_p = [
+            {'params': model.parameters(), 'lr': args.learning_rate}
+        ]
+        logger.info("Uncertainty loss NOT used")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(train_p, lr=args.learning_rate)
+ 
     # optimizer = Lion(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
     # optimizer = torch.optim.Muon(model.parameters(), lr=args.learning_rate)
 
@@ -417,8 +458,11 @@ def train(model, model_name, train_loader, valid_loader, test_loader, bolivia_lo
         criterion = LovaszLoss(mode='multiclass', per_image=False, from_logits=True, ignore_index=255)
     elif args.loss_func == 'tversky':
         criterion = TverskyLoss(mode='multiclass', alpha=0.3, beta=0.7, gamma=1.33, eps=1e-7, ignore_index=255, from_logits=True)
+    elif args.loss_func == "cwmi":
+        criterion = CWMI_loss(complex=False, cw=([0.7, 0.3]), spN=4, spK=4, lamb=0.4, CW_method="MI")
 
     scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, args.epochs)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
      
     attention_based_model = ['DSUNet_Prithvi','DSUNet3P_Prithvi','HydraUNet_Prithvi','HydraUNet3P_Prithvi']
     three_phase_model = ['DSUNet_EarlyFS', 'DSUNet_MiddleFS', 'DSUNet_LateFS']
@@ -618,7 +662,8 @@ def main(args):
                     n_channels=6,
                     n_classes=2,
                     scheme="ghost",
-                    deep_sup=True
+                    deep_sup=True,
+                    bayes_loss=True
                 )
             }
 
